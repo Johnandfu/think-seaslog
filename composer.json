@@ -1,0 +1,22 @@
+{
+    "name": "john-seelea/think-seaslog",
+    "description": "SeasLog extend for thinkphp6.0",
+    "license": "Apache-2.0",
+    "type": "think-extend",
+    "authors": [
+        {
+            "name": "john",
+            "email": "john@gmail.com"
+        }
+    ],
+    "require": {
+	    "topthink/framework": "^6.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "think\\log\\driver\\": "src"
+        },
+        "files": [
+        ]
+    }
+}
