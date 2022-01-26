@@ -2,17 +2,18 @@
 // +----------------------------------------------------------------------
 // | ThinkPHP [ WE CAN DO IT JUST THINK IT ]
 // +----------------------------------------------------------------------
-// | Copyright (c) 2006-2016 http://thinkphp.cn All rights reserved.
+// | Copyright (c) 2006-2021 http://thinkphp.cn All rights reserved.
 // +----------------------------------------------------------------------
 // | Licensed ( http://www.apache.org/licenses/LICENSE-2.0 )
 // +----------------------------------------------------------------------
 // | Author: liu21st <liu21st@gmail.com>
 // +----------------------------------------------------------------------
+declare(strict_types = 1);
 
 namespace think\log\driver;
 
+use generate\field\Date;
 use think\App;
-use think\Request;
 use think\contract\LogHandlerInterface;
 
 /**
@@ -20,133 +21,182 @@ use think\contract\LogHandlerInterface;
  */
 class Seaslog implements LogHandlerInterface
 {
+    /**
+     * 配置参数
+     * @var array
+     */
     protected $config = [
-        'time_format' => ' c ',
-        'path'        => LOG_PATH,
-        'logger'      => '',
-        'json'        => false,
+        'time_format'  => 'c',
+        'file_size'    =>20,
+        'path'         => '',
+        'apart_level'  => [],
+        'max_files'    => 3,
+        'json'         => false,
+        'json_options' => JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES,
+        'format'       => '[%s][%s] %s',
+        'logger'=>'Y-m',
+        'realtime_write'=>false,
     ];
 
     // 实例化并传入参数
-    public function __construct($config = [])
+    public function __construct(App $app, $config = [])
     {
         if (is_array($config)) {
             $this->config = array_merge($this->config, $config);
         }
 
-        \SeasLog::setBasePath($this->config['path']);
-
-        if ($this->config['logger']) {
-            \SeasLog::setLogger($this->config['logger']);
+        if (empty($this->config['format'])) {
+            $this->config['format'] = '[%s][%s] %s';
         }
+
+        if (empty($this->config['path'])) {
+            $this->config['path'] = $app->getRuntimePath() . 'log';
+        }
+
+        if (substr($this->config['path'], -1) != DIRECTORY_SEPARATOR) {
+            $this->config['path'] .= DIRECTORY_SEPARATOR;
+        }
+        \SeasLog::setBasePath($this->config['path']);
+        if (empty($this->config['logger'])) {
+            $this->config['logger']='Y-m';
+        }
+        $logger=Date($this->config['logger'], time());
+        \SeasLog::setLogger($logger);
+        $this->config['path_logger']= \SeasLog::getBasePath().DIRECTORY_SEPARATOR.\SeasLog::getLastLogger().DIRECTORY_SEPARATOR;
     }
 
     /**
      * 日志写入接口
      * @access public
-     * @param  array    $log    日志信息
-     * @param  bool     $append 是否追加请求信息
+     * @param array $log 日志信息
      * @return bool
      */
-    public function save(array $log = [], $append = false)
+    public function save(array $log): bool
     {
-        if (PHP_SAPI != 'cli') {
-            if (!$this->config['json']) {
-                \SeasLog::log('info', $this->parseLog());
-            }
-            // 添加调试日志
-            if (App::$debug && $append && !$this->config['json']) {
-                \SeasLog::log('debug', $this->getDebugLog());
-            }
-        }
+        $destination = $this->getMasterLogFile();
+        $path = dirname($destination);
+        //!is_dir($path) && mkdir($path, 0755, true);
+        $info = [];
+
+        // 日志信息封装
+        $time = \DateTime::createFromFormat('0.u00 U', microtime())->setTimezone(new \DateTimeZone(date_default_timezone_get()))->format($this->config['time_format']);
 
         foreach ($log as $type => $val) {
-            if ($this->config['json']) {
-                $info[$type] = $val;
-            } else {
-                \SeasLog::log($type, implode("\n\r", $val));
-            }
-        }
-
-        if (!empty($info)) {
-            if (isset($info['info'])) {
-                array_unshift($info['info'], $this->parseLog(true));
-            } else {
-                $info['info'][] = $this->parseLog(true);
-            }
-
-            if (App::$debug && $append) {
-                if (isset($info['debug'])) {
-                    array_unshift($info['debug'], $this->getDebugLog(true));
-                } else {
-                    $info['debug'][] = $this->getDebugLog(true);
+            $message = [];
+            foreach ($val as $msg) {
+                if (!is_string($msg)) {
+                    $msg = var_export($msg, true);
                 }
+
+                $message[] = $this->config['json'] ?
+                json_encode(['time' => $time, 'type' => $type, 'msg' => $msg], $this->config['json_options']) :
+                sprintf($this->config['format'], $time, $type, $msg);
             }
 
-            \SeasLog::log('info', json_encode($info, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+            if (true === $this->config['apart_level'] || in_array($type, $this->config['apart_level'])) {
+                // seaslog不支持 独立记录的日志级别
+                // $filename = $this->getApartLevelFile($path, $type);
+                // $this->write($message, $filename);
+                // continue;
+            }
+
+            $info[$type] = $message;
         }
 
-        return \SeasLog::flushBuffer();
+        if ($info) {
+            return $this->write($info, $destination);
+        }
+
+        return true;
     }
 
     /**
-     * 追加请求日志
+     * 日志写入
      * @access protected
-     * @param  bool     $json 是否JSON格式
-     * @return string
+     * @param array  $message     日志信息
+     * @param string $destination 日志文件
+     * @return bool
      */
-    protected function parseLog($json = false)
+    protected function write(array $message, string $destination): bool
     {
-        $request = Request::instance();
-        $info    = [
-            'timestamp' => date($this->config['time_format']),
-            'ip'        => $request->ip(),
-            'method'    => $request->method(),
-            'host'      => $request->host(),
-            'uri'       => $request->url(),
-        ];
+        // 检测日志文件大小，超过配置大小则备份日志文件重新生成
+        $this->checkLogSize($destination);
 
-        if ($json) {
-            return json_encode($info, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $info = [];
+      
+        foreach ($message as $type => $msg) {
+            $msg = is_array($msg) ? implode(PHP_EOL, $msg) : $msg;
+            \SeasLog::log($type, $msg);
         }
 
-        return "---------------------------------------------------------------\r\n[{$info['timestamp']}] {$info['ip']} {$info['method']} {$info['host']}{$info['uri']}";
+        // $message = implode(PHP_EOL, $info) . PHP_EOL;
+        // \SeasLog::log($type, $message);
+        $this->config['realtime_write'] &&  \SeasLog::flushBuffer();
+        return true;
     }
 
     /**
-     * 追加调试日志
-     * @access protected
-     * @param  bool     $json 是否JSON格式
+     * 获取主日志文件名
+     * @access public
      * @return string
      */
-    protected function getDebugLog($json = false)
+    protected function getMasterLogFile(): string
     {
-        if ($json) {
-            // 获取基本信息
-            $runtime = round(microtime(true) - THINK_START_TIME, 10);
-            $reqs    = $runtime > 0 ? number_format(1 / $runtime, 2) : '∞';
-
-            $memory_use = number_format((memory_get_usage() - THINK_START_MEM) / 1024, 2);
-
-            $info = [
-                'runtime' => number_format($runtime, 6) . 's',
-                'reqs'    => $reqs . 'req/s',
-                'memory'  => $memory_use . 'kb',
-                'file'    => count(get_included_files()),
-            ];
-            return json_encode($info, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($this->config['max_files']) {
+            $files = glob($this->config['path_logger']. '*.log');
+            
+            try {
+                if (count($files) > $this->config['max_files']) {
+                    set_error_handler(function ($errno, $errstr, $errfile, $errline) {
+                    });
+                    unlink($files[0]);
+                    restore_error_handler();
+                }
+            } catch (\Exception $e) {
+                //
+            }
         }
-        // 增加额外的调试信息
-        $runtime = round(microtime(true) - THINK_START_TIME, 10);
-        $reqs    = $runtime > 0 ? number_format(1 / $runtime, 2) : '∞';
+        // seaslog 不支持自定义文件名
+        return $this->config['path_logger'].date('Ymd').'.log';
+    }
 
-        $memory_use = number_format((memory_get_usage() - THINK_START_MEM) / 1024, 2);
+    /**
+     * 获取独立日志文件名
+     * @access public
+     * @param string $path 日志目录
+     * @param string $type 日志类型
+     * @return string
+     */
+    protected function getApartLevelFile(string $path, string $type): string
+    {
+        if ($this->config['single']) {
+            $name = is_string($this->config['single']) ? $this->config['single'] : 'single';
 
-        $time_str   = '[运行时间：' . number_format($runtime, 6) . 's] [吞吐率：' . $reqs . 'req/s]';
-        $memory_str = ' [内存消耗：' . $memory_use . 'kb]';
-        $file_load  = ' [文件加载：' . count(get_included_files()) . ']';
+            $name .= '_' . $type;
+        } elseif ($this->config['max_files']) {
+            $name = date('Ymd') . '_' . $type;
+        } else {
+            $name = date('d') . '_' . $type;
+        }
 
-        return $time_str . $memory_str . $file_load;
+        return $path . DIRECTORY_SEPARATOR . $name . '.log';
+    }
 
+    /**
+     * 检查日志文件大小并自动生成备份文件
+     * @access protected
+     * @param string $destination 日志文件
+     * @return void
+     */
+    protected function checkLogSize(string $destination): void
+    {
+       
+        if (is_file($destination)) {
+            try {
+                rename($destination, dirname($destination) . DIRECTORY_SEPARATOR . time() . '-' . basename($destination));
+            } catch (\Exception $e) {
+               
+            }
+        }
     }
 }
